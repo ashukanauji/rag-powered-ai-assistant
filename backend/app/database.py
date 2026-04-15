@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +10,11 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+
+from .config import get_settings
+from .exceptions import RetrievalError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,81 +28,79 @@ class RetrievedChunk:
 
 
 class VectorStore:
-    """Persistent ChromaDB wrapper.
+    """Persistent ChromaDB wrapper."""
 
-    Why this abstraction: keeps all DB concerns in one place and allows
-    swapping ChromaDB for FAISS in the future without changing API routes.
-    """
-
-    def __init__(
-        self,
-        persist_dir: str = "backend/data/chroma",
-        collection_name: str = "documents",
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    ) -> None:
+    def __init__(self) -> None:
+        settings = get_settings()
+        persist_dir = settings.chroma_persist_dir
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
+
         self.client = chromadb.PersistentClient(
             path=persist_dir,
             settings=Settings(anonymized_telemetry=False),
         )
-        self.collection = self.client.get_or_create_collection(name=collection_name)
-        self.encoder = SentenceTransformer(embedding_model)
+        self.collection = self.client.get_or_create_collection(name=settings.chroma_collection_name)
+        self.encoder = SentenceTransformer(settings.embedding_model)
 
     def add_chunks(self, chunks: list[dict[str, Any]]) -> int:
         if not chunks:
             return 0
 
-        ids = [str(uuid.uuid4()) for _ in chunks]
-        docs = [c["text"] for c in chunks]
-        metadatas = [
-            {
-                "source": c.get("source", "unknown"),
-                "chunk_index": c.get("chunk_index", 0),
-            }
-            for c in chunks
-        ]
-        embeddings = self.encoder.encode(docs, convert_to_numpy=True).tolist()
-        self.collection.add(ids=ids, documents=docs, metadatas=metadatas, embeddings=embeddings)
-        return len(ids)
+        try:
+            ids = [str(uuid.uuid4()) for _ in chunks]
+            docs = [c["text"] for c in chunks]
+            metadatas = [
+                {
+                    "source": c.get("source", "unknown"),
+                    "chunk_index": c.get("chunk_index", 0),
+                }
+                for c in chunks
+            ]
+            embeddings = self.encoder.encode(docs, convert_to_numpy=True, batch_size=64).tolist()
+            self.collection.add(ids=ids, documents=docs, metadatas=metadatas, embeddings=embeddings)
+            return len(ids)
+        except Exception as exc:
+            logger.exception("VectorStore add_chunks failed")
+            raise RetrievalError("Failed to add chunks to vector store") from exc
 
     def query(self, query: str, top_k: int = 5, source_filter: str | None = None) -> list[RetrievedChunk]:
         where = {"source": source_filter} if source_filter else None
-        query_embedding = self.encoder.encode([query], convert_to_numpy=True).tolist()[0]
-        result = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        docs = result.get("documents", [[]])[0]
-        metas = result.get("metadatas", [[]])[0]
-        distances = result.get("distances", [[]])[0]
-
-        chunks: list[RetrievedChunk] = []
-        for idx, text in enumerate(docs):
-            metadata = metas[idx] if idx < len(metas) else {}
-            distance = float(distances[idx]) if idx < len(distances) else 0.0
-            chunks.append(
-                RetrievedChunk(
-                    chunk_id=f"dense-{idx}",
-                    text=text,
-                    source=metadata.get("source", "unknown"),
-                    score=1.0 / (1.0 + distance),
-                )
+        try:
+            query_embedding = self.encoder.encode([query], convert_to_numpy=True).tolist()[0]
+            result = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                where=where,
+                include=["documents", "metadatas", "distances"],
             )
-        return chunks
+
+            docs = result.get("documents", [[]])[0]
+            metas = result.get("metadatas", [[]])[0]
+            distances = result.get("distances", [[]])[0]
+
+            chunks: list[RetrievedChunk] = []
+            for idx, text in enumerate(docs):
+                metadata = metas[idx] if idx < len(metas) else {}
+                distance = float(distances[idx]) if idx < len(distances) else 0.0
+                chunks.append(
+                    RetrievedChunk(
+                        chunk_id=f"dense-{idx}",
+                        text=text,
+                        source=metadata.get("source", "unknown"),
+                        score=1.0 / (1.0 + distance),
+                    )
+                )
+            return chunks
+        except Exception as exc:
+            logger.exception("VectorStore query failed")
+            raise RetrievalError("Failed to query vector store") from exc
 
 
 class CorpusStore:
-    """JSONL-based corpus for BM25 retrieval index rebuild.
+    """JSONL-based corpus for BM25 retrieval index rebuild."""
 
-    Tradeoff: simple and transparent persistence; slower than a dedicated
-    search engine for very large corpora, but enough for SMB workloads.
-    """
-
-    def __init__(self, file_path: str = "backend/data/corpus.jsonl") -> None:
-        self.file_path = Path(file_path)
+    def __init__(self) -> None:
+        self.file_path = Path(get_settings().corpus_file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.file_path.exists():
             self.file_path.write_text("", encoding="utf-8")
