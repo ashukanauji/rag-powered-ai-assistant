@@ -157,6 +157,7 @@ docker run -p 8000:8000 --env-file .env rag-assistant
 ```bash
 cd docker
 docker compose --env-file ../.env up --build
+docker compose --env-file .env -f docker/docker-compose.yml up --build
 ```
 
 ## Deployment Notes (Render / AWS)
